@@ -3,7 +3,7 @@
 python bot.py draft    -> news chuno, poster + caption banao, Telegram pe approval ke liye bhejo
 python bot.py approve  -> Telegram buttons check karo, Approve hua to Facebook page pe post karo
 """
-import os, sys, io, re, json, glob, hashlib, time, datetime as dt
+import os, sys, io, re, json, glob, hashlib, time, subprocess, datetime as dt
 import requests, feedparser
 from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
@@ -407,42 +407,69 @@ def full_caption(g):
 def in_window(now):
     return 6 <= now.hour < 23 or (now.hour == 23 and now.minute < 20)
 
+# ---- pending drafts: har draft ki apni file (data/pending/<id>.json), taaki draft aur approve aapas me na takraein
+PD = f"{D}/pending"
+
+def pending_load():
+    legacy = load("pending", None)  # purana single-file format ho to usse migrate karo
+    if legacy:
+        for v in legacy.values():
+            pending_put(v)
+        os.remove(f"{D}/pending.json")
+    out = {}
+    if os.path.isdir(PD):
+        for f in os.listdir(PD):
+            if f.endswith(".json"):
+                with open(f"{PD}/{f}", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                out[d["id"]] = d
+    return out
+
+def pending_put(dr):
+    os.makedirs(PD, exist_ok=True)
+    with open(f"{PD}/{dr['id']}.json", "w", encoding="utf-8") as f:
+        json.dump(dr, f, ensure_ascii=False, indent=1)
+
+def pending_del(did):
+    p = f"{PD}/{did}.json"
+    if os.path.exists(p):
+        os.remove(p)
+
 def mode_draft():
     now = dt.datetime.now(IST)
     if not FORCE and not in_window(now):
         print("window ke bahar")
         return
-    pending = load("pending", {})
-    pending = {k: v for k, v in pending.items() if time.time() - v["created"] < EXPIRE_HOURS * 3600}
+    pending = pending_load()
+    for k, v in list(pending.items()):
+        if time.time() - v["created"] >= EXPIRE_HOURS * 3600:
+            pending_del(k)
+            pending.pop(k)
     if len(pending) >= MAX_PENDING:
         print("bahut drafts pending hain")
-        save("pending", pending)
         return
 
-    state = load("state", {})
     seen = load("seen", [])
     recent = load("recent", [])
     today = str(now.date())
+    last_reco = load("reco", {}).get("date") or load("state", {}).get("reco")
 
     # roz ek recommendation post
-    if now.hour >= RECO_AFTER_HOUR and state.get("reco") != today:
+    if now.hour >= RECO_AFTER_HOUR and last_reco != today:
         cands = candidates(set(seen))
         g = reco_json([c["title"] for c in cands])
         jpeg = make_reco_poster(g["items"])
         did = "r" + hashlib.md5(today.encode()).hexdigest()[:7]
         cap = full_caption(g)
         fid = send_draft(did, jpeg, cap, "🎬 Aaj ke 5 recommendations (titles/platform check kar lena)")
-        pending[did] = {"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "reco",
-                        "ctx": {"title": "Aaj ke 5 recommendations", "summary": json.dumps(g["items"], ensure_ascii=False)}}
-        state["reco"] = today
-        save("state", state)
-        save("pending", pending)
+        pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "reco",
+                     "ctx": {"title": "Aaj ke 5 recommendations", "summary": json.dumps(g["items"], ensure_ascii=False)}})
+        save("reco", {"date": today})
         return
 
     cands = candidates(set(seen))
     if not cands:
         print("nayi khabar nahi")
-        save("pending", pending)
         return
     g = pick_news(cands, recent)
     idx = g.get("index", -1)
@@ -476,10 +503,9 @@ def mode_draft():
     did = hashlib.md5(c["url"].encode()).hexdigest()[:8]
     cap = full_caption(g)
     fid = send_draft(did, jpeg, cap, f"📰 {c['title']}\n{c['url']}")
-    pending[did] = {"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "news", "ctx": c}
+    pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "news", "ctx": c})
     recent.append(c["title"])
     save("recent", recent[-40:])
-    save("pending", pending)
 
 def post_fb(dr):
     if not FB_TOKEN or not FB_PAGE:
@@ -503,14 +529,37 @@ def clear_buttons(mid):
 def say(text):
     tg("sendMessage", data={"chat_id": CHAT, "text": text[:4000]})
 
-def mode_approve():
-    state = load("state", {})
-    pending = load("pending", {})
-    ups = tg("getUpdates", data={"offset": state.get("offset", 0), "timeout": 0,
+# ---- git helpers (approve loop apni state khud push karta hai)
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+def git_sync():
+    r = git("pull", "--rebase", "--autostash")
+    if r.returncode:
+        print("git pull problem:", r.stderr[:200])
+
+def git_push():
+    git("add", "data")
+    if git("diff", "--cached", "--quiet").returncode:  # kuch badla hai
+        git("commit", "-m", "approve state")
+        for _ in range(3):
+            git("pull", "--rebase", "--autostash")
+            if git("push").returncode == 0:
+                break
+
+def approve_once(wait):
+    off = load("offset", {}).get("offset")
+    if off is None:
+        off = load("state", {}).get("offset", 0)
+    ups = tg("getUpdates", data={"offset": off, "timeout": wait,
                                  "allowed_updates": json.dumps(["callback_query"])})
+    if not ups:
+        return
+    git_sync()  # draft ne jo naye drafts push kiye wo le aao
+    pending = pending_load()
     print("approve: updates =", len(ups), "| pending =", list(pending))
     for u in ups:
-        state["offset"] = u["update_id"] + 1
+        off = u["update_id"] + 1
         cq = u.get("callback_query")
         if not cq or str(cq["message"]["chat"]["id"]) != str(CHAT):
             continue
@@ -530,26 +579,41 @@ def mode_approve():
             continue
         try:
             if act == "no":
+                pending_del(did)
                 pending.pop(did)
                 clear_buttons(mid)
                 say("❌ Reject kar diya")
             elif act == "ok":
                 res = post_fb(dr)
+                pending_del(did)
                 pending.pop(did)
                 clear_buttons(mid)
                 say(f"✅ Page pe post ho gaya (id: {res.get('post_id') or res.get('id')})")
             elif act == "re":
                 g = regen_caption(dr["ctx"])
                 dr["caption"] = full_caption(g)
+                pending_put(dr)
                 tg("editMessageText", data={"chat_id": CHAT, "message_id": mid,
                                             "text": f"🔁 Naya caption\n\n{dr['caption']}"[:4000],
                                             "reply_markup": keyboard(did)})
         except Exception as e:
             say(f"⚠️ Error ({act}): {str(e)[:300]}")
-    state_keep = load("state", {})
-    state_keep["offset"] = state.get("offset", 0)
-    save("state", state_keep)
-    save("pending", pending)
+    save("offset", {"offset": off})
+    git_push()
+
+def mode_approve():
+    loop = int(os.environ.get("APPROVE_LOOP", "0"))
+    if not loop:
+        approve_once(0)
+        return
+    print("approve loop:", loop, "sec")
+    end = time.time() + loop
+    while time.time() < end:
+        try:
+            approve_once(25)  # Telegram ka long-poll: click aate hi turant mil jata hai
+        except Exception as e:
+            print("loop error:", e)
+            time.sleep(10)
 
 if __name__ == "__main__":
     {"draft": mode_draft, "approve": mode_approve}[sys.argv[1]]()
