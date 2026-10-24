@@ -77,7 +77,7 @@ def pick_news(cands, recent):
         + "\n\nNeeche khabrein hain. Sabse clickable ek chuno (movie release, OTT, gossip, celeb life, outfit)."
         + " Agar koi khabar 'recent titles' jaisi hi ho to usse mat chuno. Agar sab bekaar hain to index -1 do."
         + "\n\nKHABREIN:\n" + lst + "\n\nRECENT TITLES:\n" + rec
-        + '\n\nSirf JSON do: {"index": int, "headline": "Hindi (Devanagari) hook headline, max 12 shabd", '
+        + '\n\nSirf JSON do: {"index": int, "headline": "Hindi (Devanagari) hook headline, 12-18 shabd, 2-3 line ki, ! ya quote ke saath", "highlight": ["headline me jo 2-4 naam/key shabd yellow me chamkane hain, headline se hubahu same"], '
         '"caption": "Hinglish caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
     )
     return gemini(prompt)
@@ -100,15 +100,17 @@ def reco_json(ctx_titles):
     return gemini(prompt)
 
 # ---------------------------------------------------------------- news
-def entry_image(e):
+def entry_images(e):
+    urls = []
     for k in ("media_content", "media_thumbnail"):
         for m in e.get(k) or []:
-            if m.get("url"):
-                return m["url"]
+            u = m.get("url")
+            if u and u not in urls:
+                urls.append(u)
     for l in e.get("links", []):
-        if l.get("type", "").startswith("image"):
-            return l.get("href")
-    return None
+        if l.get("type", "").startswith("image") and l.get("href") not in urls:
+            urls.append(l["href"])
+    return urls
 
 def og_image(url):
     try:
@@ -133,7 +135,7 @@ def candidates(seen):
                 "title": e.get("title", "").strip(),
                 "url": u,
                 "summary": BeautifulSoup(e.get("summary", ""), "html.parser").get_text(" ")[:350],
-                "img": entry_image(e),
+                "imgs": entry_images(e),
                 "ts": time.mktime(e["published_parsed"]) if e.get("published_parsed") else 0,
             })
     out.sort(key=lambda c: c["ts"], reverse=True)
@@ -186,31 +188,62 @@ def cover(img, w, h):
 def add_logo(img):
     if os.path.exists("assets/logo.png"):
         lg = Image.open("assets/logo.png").convert("RGBA")
-        lg.thumbnail((220, 220))
-        img.paste(lg, (W - lg.width - 40, 40), lg)
+        lg.thumbnail((200, 200))
+        img.paste(lg, (W - lg.width - 30, 30), lg)
 
 def to_jpeg(img):
     b = io.BytesIO()
     img.save(b, "JPEG", quality=92)
     return b.getvalue()
 
-def make_poster(photo, headline):
-    base = cover(photo, W, H).convert("RGBA")
-    d = ImageDraw.Draw(base, "RGBA")
-    f = font(64)
-    lines = wrap(d, headline, f, W - 170)[:4]
-    lh = 96
-    box_h = len(lines) * lh + 70
-    top = H - box_h - 70
-    d.rectangle([40, top, W - 40, top + box_h], fill=(0, 0, 0, 190))
-    d.rectangle([40, top, 54, top + box_h], fill=(255, 196, 0, 255))
-    y = top + 30
-    for l in lines:
-        d.text((85, y), l, font=f, fill="white")
+BAND = 340            # neeche dark band ki height
+YELLOW = (255, 214, 0)
+
+def clean(w):
+    return w.strip("।,.!?‘’“”'\"-:;()")
+
+def draw_headline(d, text, highlight, top, bottom):
+    hl = {clean(w) for h in highlight for w in h.split()}
+    maxw = W - 120
+    for sz in (58, 52, 47, 43, 39):
+        f = font(sz)
+        lines = wrap(d, text, f, maxw)
+        if len(lines) <= 3:
+            break
+    lh = int(sz * 1.45)
+    y = top + (bottom - top - len(lines) * lh) // 2
+    space = d.textlength(" ", font=f)
+    for line in lines:
+        words = line.split()
+        lw = sum(d.textlength(w, font=f) for w in words) + space * (len(words) - 1)
+        x = (W - lw) / 2
+        for w in words:
+            d.text((x, y), w, font=f, fill=YELLOW if clean(w) in hl else "white")
+            x += d.textlength(w, font=f) + space
         y += lh
-    base = base.convert("RGB")
-    add_logo(base)
-    return to_jpeg(base)
+
+def same_pic(a, b):
+    sa = a.convert("L").resize((16, 16))
+    sb = b.convert("L").resize((16, 16))
+    diff = sum(abs(x - y) for x, y in zip(sa.getdata(), sb.getdata())) / 256
+    return diff < 18
+
+def make_poster(photo, headline, highlight=(), inset=None):
+    img = Image.new("RGB", (W, H), (38, 38, 38))
+    top_h = H - BAND
+    img.paste(cover(photo, W, top_h), (0, 0))
+    d = ImageDraw.Draw(img)
+    if inset is not None:
+        s = 400
+        c = cover(inset, s, s)
+        mask = Image.new("L", (s, s), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, s - 1, s - 1), fill=255)
+        x, y = 50, top_h - s + 10
+        d.ellipse((x - 10, y - 10, x + s + 10, y + s + 10), fill=(220, 30, 30))
+        img.paste(c, (x, y), mask)
+    draw_headline(d, headline, highlight, top_h, H)
+    add_logo(img)
+    return to_jpeg(img)
 
 def make_reco_poster(items):
     img = Image.new("RGB", (W, H))
@@ -304,7 +337,8 @@ def mode_draft():
     c = cands[idx]
     seen.append(c["url"])
     save("seen", seen[-2000:])
-    img_url = c["img"] or og_image(c["url"])
+    imgs = c["imgs"]
+    img_url = imgs[0] if imgs else og_image(c["url"])
     if not img_url:
         print("image nahi mili, skip")
         return
@@ -313,7 +347,15 @@ def mode_draft():
     except Exception as e:
         print("image download fail:", e)
         return
-    jpeg = make_poster(photo, g["headline"])
+    inset = None
+    if len(imgs) > 1:  # doosri alag photo mile to gola inset lagega
+        try:
+            second = download(imgs[1])
+            if not same_pic(photo, second):
+                inset = second
+        except Exception:
+            pass
+    jpeg = make_poster(photo, g["headline"], g.get("highlight", []), inset)
     did = hashlib.md5(c["url"].encode()).hexdigest()[:8]
     cap = full_caption(g)
     fid = send_draft(did, jpeg, cap, f"📰 {c['title']}\n{c['url']}")
