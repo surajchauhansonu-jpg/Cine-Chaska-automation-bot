@@ -1,4 +1,3 @@
-
 name: draft
 
 on:
@@ -64,7 +63,10 @@ jobs:
           git add data
           if ! git diff --cached --quiet; then
             git commit -m "Update bot state"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            for i in 1 2 3; do
+              git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && break
+              sleep 5
+            done
           else
             echo "No state changes to save."
           fi
