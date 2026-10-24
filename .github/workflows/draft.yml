@@ -1,8 +1,8 @@
 name: draft
 on:
   schedule:
-    - cron: "30 0 * * *"      # 6:00 AM IST
-    - cron: "0,30 1-17 * * *" # 6:30 AM se 11:00 PM IST
+    - cron: "30 0 * * *"
+    - cron: "0,30 1-17 * * *"
   workflow_dispatch:
 concurrency:
   group: bot
@@ -18,10 +18,15 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install -y fonts-noto-core libraqm0
+      - run: sudo apt-get update && sudo apt-get install -y libraqm0
+      - name: Hindi font
+        run: |
+          mkdir -p assets
+          [ -f assets/font.ttf ] || curl -fsSL -o assets/font.ttf "https://raw.githubusercontent.com/google/fonts/main/ofl/hind/Hind-Bold.ttf"
       - run: pip install -r requirements.txt
       - run: mkdir -p data && python bot.py draft
         env:
+          FORCE: "1"
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
