@@ -1,36 +1,70 @@
+
 name: draft
+
 on:
   schedule:
     - cron: "30 0 * * *"
     - cron: "0,30 1-17 * * *"
   workflow_dispatch:
+
 concurrency:
   group: bot
   cancel-in-progress: false
+
 permissions:
   contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: sudo apt-get update && sudo apt-get install -y libraqm0
+
+      - name: Configure Git and sync
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+
+      - name: Install system dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libraqm0
+
       - name: Hindi font
         run: |
           mkdir -p assets
-          [ -f assets/font.ttf ] || curl -fsSL -o assets/font.ttf "https://raw.githubusercontent.com/google/fonts/main/ofl/hind/Hind-Bold.ttf"
-      - run: pip install -r requirements.txt
-      - run: mkdir -p data && python bot.py draft
+          if [ ! -f assets/font.ttf ]; then
+            curl -fsSL -o assets/font.ttf \
+              "https://raw.githubusercontent.com/google/fonts/main/ofl/hind/Hind-Bold.ttf"
+          fi
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate news draft and poster
+        run: |
+          mkdir -p data
+          python bot.py draft
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      - run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
+
+      - name: Save state to GitHub
+        run: |
           git add data
-          git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)
+          if ! git diff --cached --quiet; then
+            git commit -m "Update bot state"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
+            echo "No state changes to save."
+          fi
