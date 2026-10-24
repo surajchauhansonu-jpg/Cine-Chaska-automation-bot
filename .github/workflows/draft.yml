@@ -26,7 +26,6 @@ jobs:
       - run: pip install -r requirements.txt
       - run: mkdir -p data && python bot.py draft
         env:
-          FORCE: "1"
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
