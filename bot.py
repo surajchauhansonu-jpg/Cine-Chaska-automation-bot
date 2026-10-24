@@ -482,6 +482,8 @@ def mode_draft():
     save("pending", pending)
 
 def post_fb(dr):
+    if not FB_TOKEN or not FB_PAGE:
+        raise RuntimeError("FB_PAGE_ID / FB_PAGE_TOKEN secret workflow tak nahi pahunch raha (approve.yml ke env me dekho)")
     f = tg("getFile", data={"file_id": dr["file_id"]})
     img = requests.get(f"https://api.telegram.org/file/bot{TG}/{f['file_path']}", timeout=60).content
     r = requests.post(
@@ -506,6 +508,7 @@ def mode_approve():
     pending = load("pending", {})
     ups = tg("getUpdates", data={"offset": state.get("offset", 0), "timeout": 0,
                                  "allowed_updates": json.dumps(["callback_query"])})
+    print("approve: updates =", len(ups), "| pending =", list(pending))
     for u in ups:
         state["offset"] = u["update_id"] + 1
         cq = u.get("callback_query")
@@ -523,6 +526,7 @@ def mode_approve():
                 clear_buttons(mid)
             except Exception:
                 pass
+            say("⚠️ Ye draft ab pending list me nahi mila (4 ghante se purana ho gaya, ya pehle hi process ho chuka). Naye draft ka wait karo.")
             continue
         try:
             if act == "no":
@@ -530,10 +534,10 @@ def mode_approve():
                 clear_buttons(mid)
                 say("❌ Reject kar diya")
             elif act == "ok":
-                post_fb(dr)
+                res = post_fb(dr)
                 pending.pop(did)
                 clear_buttons(mid)
-                say("✅ Page pe post ho gaya")
+                say(f"✅ Page pe post ho gaya (id: {res.get('post_id') or res.get('id')})")
             elif act == "re":
                 g = regen_caption(dr["ctx"])
                 dr["caption"] = full_caption(g)
