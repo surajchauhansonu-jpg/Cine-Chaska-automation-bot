@@ -3,10 +3,10 @@
 python bot.py draft    -> news chuno, poster + caption banao, Telegram pe approval ke liye bhejo
 python bot.py approve  -> Telegram buttons check karo, Approve hua to Facebook page pe post karo
 """
-import os, sys, io, json, glob, hashlib, time, datetime as dt
+import os, sys, io, re, json, glob, hashlib, time, datetime as dt
 import requests, feedparser
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 UA = "Mozilla/5.0 (compatible; CineChaskaBot/1.0)"
@@ -87,7 +87,7 @@ def pick_news(cands, recent):
         + "\n\nNeeche khabrein hain. Sabse clickable ek chuno (movie release, OTT, gossip, celeb life, outfit)."
         + " Agar koi khabar 'recent titles' jaisi hi ho to usse mat chuno. Agar sab bekaar hain to index -1 do."
         + "\n\nKHABREIN:\n" + lst + "\n\nRECENT TITLES:\n" + rec
-        + '\n\nSirf JSON do: {"index": int, "headline": "Hindi (Devanagari) hook headline, 12-18 shabd, 2-3 line ki, ! ya quote ke saath", "highlight": ["headline me jo 2-4 naam/key shabd yellow me chamkane hain, headline se hubahu same"], '
+        + '\n\nSirf JSON do: {"index": int, "headline": "POORI Devanagari (Hindi) lipi me hook headline, 12-18 shabd, ! ya quote ke saath. Roman/English letters mat use karo (naam bhi Devanagari me, jaise सैफ अली खान, KBC jaise short-form hi Roman me). Emoji bilkul nahi", "highlight": ["headline me jo 2-4 naam/key shabd yellow me chamkane hain, headline se hubahu same"], '
         '"category": "release|ott|gossip|celeb|outfit|other me se ek", "caption": "Hinglish caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
     )
     return gemini(prompt)
@@ -243,22 +243,44 @@ def same_pic(a, b):
     diff = sum(abs(x - y) for x, y in zip(sa.getdata(), sb.getdata())) / 256
     return diff < 18
 
+EMOJI = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200d]")
+
+def no_emoji(t):
+    return re.sub(r"\s+", " ", EMOJI.sub("", t)).strip()
+
 def make_poster(photo, headline, highlight=(), inset=None, category="other"):
-    img = cover(photo, W, H).convert("RGBA")
-    probe = ImageDraw.Draw(img)
+    headline = no_emoji(headline)
+    highlight = [no_emoji(h) for h in highlight]
+
+    # pehle text ka layout nikalo taaki photo ki jagah pata ho
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 10)))
     for sz in (64, 58, 53, 49, 45, 41):
         f = font(sz)
         lines = wrap(probe, headline, f, W - 220)
         if len(lines) <= 3:
             break
     lh = int(sz * 1.5)
-    text_h = len(lines) * lh
-    panel_h = text_h + 140
+    panel_h = len(lines) * lh + 140
     p_bot = H - 70
     p_top = p_bot - panel_h
 
-    img = vgrad(img, 0, 280, 150, 0, (0, 0, 0))                # upar logo ke liye halka andhera
-    img = vgrad(img, p_top - 330, p_top, 0, 215, (12, 6, 28))  # photo neeche smoothly dark
+    wide = photo.width / photo.height > 1.05
+    if wide:
+        # chaudi photo: poori dikhao (chehre na katein), peeche blur wala background
+        bg = cover(photo, W, H).filter(ImageFilter.GaussianBlur(32))
+        bg = ImageEnhance.Brightness(bg).enhance(0.55)
+        img = bg.convert("RGBA")
+        fh = int(photo.height * W / photo.width)
+        fg = photo.resize((W, fh))
+        fy = max(0, (p_top - 40 - fh) // 2 + 20)
+        img.paste(fg, (0, fy))
+        fade = 120
+    else:
+        img = cover(photo, W, H).convert("RGBA")
+        fade = 330
+
+    img = vgrad(img, 0, 280, 150, 0, (0, 0, 0))                    # upar logo ke liye halka andhera
+    img = vgrad(img, p_top - fade, p_top, 0, 215, (12, 6, 28))     # photo neeche smoothly dark
     ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
     ImageDraw.Draw(ov).rounded_rectangle((50, p_top, W - 50, p_bot), radius=36,
                                          fill=(26, 14, 52, 240), outline=GOLD + (255,), width=3)
@@ -286,17 +308,16 @@ def make_poster(photo, headline, highlight=(), inset=None, category="other"):
             x += d.textlength(w, font=f) + space
         y += lh
 
-    # brand line
     d.text((W / 2, p_bot - 38), "C I N E   C H A S K A", font=font(26), fill=GOLD, anchor="mm")
 
     # gola inset
     if inset is not None:
-        s = 340
-        c = cover(inset, s, s)
-        mask = Image.new("L", (s, s), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, s - 1, s - 1), fill=255)
-        x, y0 = 50, p_top - 60 - s
-        d.ellipse((x - 9, y0 - 9, x + s + 9, y0 + s + 9), fill=GOLD)
+        s_ = 340
+        c = cover(inset, s_, s_)
+        mask = Image.new("L", (s_, s_), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, s_ - 1, s_ - 1), fill=255)
+        x, y0 = 50, p_top - 60 - s_
+        d.ellipse((x - 9, y0 - 9, x + s_ + 9, y0 + s_ + 9), fill=GOLD)
         img.paste(c, (x, y0), mask)
 
     add_logo(img)
