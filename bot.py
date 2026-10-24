@@ -16,7 +16,9 @@ W, H = 1080, 1350  # 4:5
 TG = os.environ.get("TG_TOKEN", "")
 CHAT = os.environ.get("TG_CHAT_ID", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# pehla model na chale (404/429/503) to agla try hota hai
+MODELS = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3.5-flash-lite",
+                      "gemini-3.1-flash-lite", "gemini-3-flash-preview"] if m]
 FB_PAGE = os.environ.get("FB_PAGE_ID", "")
 FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
 GRAPH = os.environ.get("GRAPH_VER", "v23.0")
@@ -51,17 +53,25 @@ def save(name, val):
 
 # ---------------------------------------------------------------- gemini
 def gemini(prompt):
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
-        headers={"x-goog-api-key": GEMINI_KEY},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.8},
-        },
-        timeout=120,
-    )
-    r.raise_for_status()
-    return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    last = None
+    for m in MODELS:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+            headers={"x-goog-api-key": GEMINI_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.8},
+            },
+            timeout=120,
+        )
+        if r.status_code in (404, 429, 503):
+            last = f"{m}: {r.status_code} {r.text[:150]}"
+            print("model skip ->", last)
+            continue
+        r.raise_for_status()
+        print("gemini model:", m)
+        return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    raise RuntimeError("Koi Gemini model nahi chala. Last: " + str(last))
 
 STYLE = (
     "Tum 'Cine Chaska' naam ke Bollywood news Facebook page ke editor ho. "
