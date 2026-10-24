@@ -88,7 +88,7 @@ def pick_news(cands, recent):
         + " Agar koi khabar 'recent titles' jaisi hi ho to usse mat chuno. Agar sab bekaar hain to index -1 do."
         + "\n\nKHABREIN:\n" + lst + "\n\nRECENT TITLES:\n" + rec
         + '\n\nSirf JSON do: {"index": int, "headline": "Hindi (Devanagari) hook headline, 12-18 shabd, 2-3 line ki, ! ya quote ke saath", "highlight": ["headline me jo 2-4 naam/key shabd yellow me chamkane hain, headline se hubahu same"], '
-        '"caption": "Hinglish caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
+        '"category": "release|ott|gossip|celeb|outfit|other me se ek", "caption": "Hinglish caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
     )
     return gemini(prompt)
 
@@ -157,6 +157,8 @@ def download(url):
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
 # ---------------------------------------------------------------- poster
+FONT = None
+
 def find_font():
     if os.path.exists("assets/font.ttf"):
         return "assets/font.ttf"
@@ -164,12 +166,13 @@ def find_font():
     fs.sort(key=lambda p: ("Bold" not in p, len(p)))
     if fs:
         return fs[0]
-    fs = glob.glob("/usr/share/fonts/**/DejaVuSans-Bold.ttf", recursive=True)
-    return fs[0] if fs else None
-
-FONT = find_font()
+    raise SystemExit("Hindi font nahi mila. assets/font.ttf daalo.")
 
 def font(sz):
+    global FONT
+    if FONT is None:
+        FONT = find_font()
+        print("font:", FONT)
     try:
         return ImageFont.truetype(FONT, sz, layout_engine=ImageFont.Layout.RAQM)
     except Exception:
@@ -192,37 +195,88 @@ def cover(img, w, h):
     r = max(w / img.width, h / img.height)
     img = img.resize((int(img.width * r) + 1, int(img.height * r) + 1))
     x = (img.width - w) // 2
-    y = (img.height - h) // 3  # thoda upar se crop, chehre bachte hain
+    y = (img.height - h) // 4  # thoda upar se crop, chehre bachte hain
     return img.crop((x, y, x + w, y + h))
 
+def find_logo():
+    exts = (".png", ".webp", ".jpg", ".jpeg")
+    found = []
+    for root, _, files in os.walk("assets"):
+        found += [os.path.join(root, f) for f in files if f.lower().endswith(exts)]
+    found += [f for f in os.listdir(".") if f.lower().endswith(exts) and "logo" in f.lower()]
+    found.sort(key=lambda p: ("logo" not in os.path.basename(p).lower(), p))
+    return found[0] if found else None
+
 def add_logo(img):
-    if os.path.exists("assets/logo.png"):
-        lg = Image.open("assets/logo.png").convert("RGBA")
-        lg.thumbnail((200, 200))
-        img.paste(lg, (W - lg.width - 30, 30), lg)
+    p = find_logo()
+    if not p:
+        print("logo nahi mila, assets/ me logo.png daalo")
+        return
+    lg = Image.open(p).convert("RGBA")
+    lg.thumbnail((190, 190))
+    img.paste(lg, (W - lg.width - 36, 36), lg)
 
 def to_jpeg(img):
     b = io.BytesIO()
-    img.save(b, "JPEG", quality=92)
+    img.convert("RGB").save(b, "JPEG", quality=93)
     return b.getvalue()
 
-BAND = 340            # neeche dark band ki height
+GOLD = (255, 196, 0)
 YELLOW = (255, 214, 0)
+CATS = {"release": "नई रिलीज़", "ott": "OTT अपडेट", "gossip": "गॉसिप",
+        "celeb": "सितारों की खबर", "outfit": "फैशन", "other": "ताज़ा खबर"}
 
 def clean(w):
     return w.strip("।,.!?‘’“”'\"-:;()")
 
-def draw_headline(d, text, highlight, top, bottom):
-    hl = {clean(w) for h in highlight for w in h.split()}
-    maxw = W - 120
-    for sz in (58, 52, 47, 43, 39):
+def vgrad(img, y0, y1, a0, a1, rgb):
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    for y in range(y0, y1):
+        t = (y - y0) / max(1, y1 - y0)
+        d.line([(0, y), (img.width, y)], fill=rgb + (int(a0 + (a1 - a0) * t),))
+    return Image.alpha_composite(img, ov)
+
+def same_pic(a, b):
+    sa = a.convert("L").resize((16, 16))
+    sb = b.convert("L").resize((16, 16))
+    diff = sum(abs(x - y) for x, y in zip(sa.getdata(), sb.getdata())) / 256
+    return diff < 18
+
+def make_poster(photo, headline, highlight=(), inset=None, category="other"):
+    img = cover(photo, W, H).convert("RGBA")
+    probe = ImageDraw.Draw(img)
+    for sz in (64, 58, 53, 49, 45, 41):
         f = font(sz)
-        lines = wrap(d, text, f, maxw)
+        lines = wrap(probe, headline, f, W - 220)
         if len(lines) <= 3:
             break
-    lh = int(sz * 1.45)
-    y = top + (bottom - top - len(lines) * lh) // 2
+    lh = int(sz * 1.5)
+    text_h = len(lines) * lh
+    panel_h = text_h + 140
+    p_bot = H - 70
+    p_top = p_bot - panel_h
+
+    img = vgrad(img, 0, 280, 150, 0, (0, 0, 0))                # upar logo ke liye halka andhera
+    img = vgrad(img, p_top - 330, p_top, 0, 215, (12, 6, 28))  # photo neeche smoothly dark
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(ov).rounded_rectangle((50, p_top, W - 50, p_bot), radius=36,
+                                         fill=(26, 14, 52, 240), outline=GOLD + (255,), width=3)
+    img = Image.alpha_composite(img, ov).convert("RGB")
+    d = ImageDraw.Draw(img)
+
+    # category pill
+    pf = font(34)
+    label = CATS.get(category, CATS["other"])
+    pw = int(d.textlength(label, font=pf)) + 64
+    px, py = 90, p_top - 30
+    d.rounded_rectangle((px, py, px + pw, py + 60), radius=30, fill=GOLD)
+    d.text((px + pw / 2, py + 30), label, font=pf, fill=(24, 10, 40), anchor="mm")
+
+    # headline (naam yellow me)
+    hl = {clean(w) for h in highlight for w in h.split()}
     space = d.textlength(" ", font=f)
+    y = p_top + 64
     for line in lines:
         words = line.split()
         lw = sum(d.textlength(w, font=f) for w in words) + space * (len(words) - 1)
@@ -232,26 +286,19 @@ def draw_headline(d, text, highlight, top, bottom):
             x += d.textlength(w, font=f) + space
         y += lh
 
-def same_pic(a, b):
-    sa = a.convert("L").resize((16, 16))
-    sb = b.convert("L").resize((16, 16))
-    diff = sum(abs(x - y) for x, y in zip(sa.getdata(), sb.getdata())) / 256
-    return diff < 18
+    # brand line
+    d.text((W / 2, p_bot - 38), "C I N E   C H A S K A", font=font(26), fill=GOLD, anchor="mm")
 
-def make_poster(photo, headline, highlight=(), inset=None):
-    img = Image.new("RGB", (W, H), (38, 38, 38))
-    top_h = H - BAND
-    img.paste(cover(photo, W, top_h), (0, 0))
-    d = ImageDraw.Draw(img)
+    # gola inset
     if inset is not None:
-        s = 400
+        s = 340
         c = cover(inset, s, s)
         mask = Image.new("L", (s, s), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, s - 1, s - 1), fill=255)
-        x, y = 50, top_h - s + 10
-        d.ellipse((x - 10, y - 10, x + s + 10, y + s + 10), fill=(220, 30, 30))
-        img.paste(c, (x, y), mask)
-    draw_headline(d, headline, highlight, top_h, H)
+        x, y0 = 50, p_top - 60 - s
+        d.ellipse((x - 9, y0 - 9, x + s + 9, y0 + s + 9), fill=GOLD)
+        img.paste(c, (x, y0), mask)
+
     add_logo(img)
     return to_jpeg(img)
 
@@ -365,7 +412,7 @@ def mode_draft():
                 inset = second
         except Exception:
             pass
-    jpeg = make_poster(photo, g["headline"], g.get("highlight", []), inset)
+    jpeg = make_poster(photo, g["headline"], g.get("highlight", []), inset, g.get("category", "other"))
     did = hashlib.md5(c["url"].encode()).hexdigest()[:8]
     cap = full_caption(g)
     fid = send_draft(did, jpeg, cap, f"📰 {c['title']}\n{c['url']}")
