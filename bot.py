@@ -76,7 +76,7 @@ def gemini(prompt):
 STYLE = (
     "Tum 'Cine Chaska' naam ke Bollywood news Facebook page ke editor ho. "
     "Tone: masaledar, chatpati, youth wali, lekin sirf diye gaye facts use karo, koi naya fact ya quote mat banao. "
-    "Caption Hinglish (Roman Hindi) me, 4-6 chhoti lines, kuch emojis, aakhir me ek sawal jisse comments aaye."
+    "Poora text (headline aur caption) shuddh Hindi me, Devanagari lipi me, bol-chal wali chatpati bhasha. English ke aam shabd (OTT, KBC, trailer, ad) Roman me chalenge. ZARURI: ek hi shabd me Hindi aur English akshar kabhi mix mat karo. Ya to poora Devanagari (जैसे बिलियनेयर, सीरीज़) ya poora Roman (Billionaire). Series/film ka naam English ho to poora Roman me likho. Caption 4-6 chhoti lines, kuch emojis, aakhir me ek sawal jisse comments aaye."
 )
 
 def pick_news(cands, recent):
@@ -88,9 +88,46 @@ def pick_news(cands, recent):
         + " Agar koi khabar 'recent titles' jaisi hi ho to usse mat chuno. Agar sab bekaar hain to index -1 do."
         + "\n\nKHABREIN:\n" + lst + "\n\nRECENT TITLES:\n" + rec
         + '\n\nSirf JSON do: {"index": int, "headline": "POORI Devanagari (Hindi) lipi me hook headline, 12-18 shabd, ! ya quote ke saath. Roman/English letters mat use karo (naam bhi Devanagari me, jaise सैफ अली खान, KBC jaise short-form hi Roman me). Emoji bilkul nahi", "highlight": ["headline me jo 2-4 naam/key shabd yellow me chamkane hain, headline se hubahu same"], '
-        '"category": "release|ott|gossip|celeb|outfit|other me se ek", "caption": "Hinglish caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
+        '"category": "release|ott|gossip|celeb|outfit|other me se ek", "caption": "Hindi (Devanagari) caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
     )
     return gemini(prompt)
+
+def deva_ratio(t):
+    letters = [c for c in t if c.isalpha()]
+    if not letters:
+        return 1.0
+    return sum("\u0900" <= c <= "\u097f" for c in letters) / len(letters)
+
+def has_mixed(t):
+    """Kisi ek shabd me Devanagari aur Roman dono ho (jaise बिलियनaire) to True."""
+    for w in re.split(r"[\s\-–—/]+", t):
+        if re.search("[\u0900-\u097f]", w) and re.search("[A-Za-z]", w):
+            return True
+    return False
+
+def ensure_hindi(g):
+    """Roman ya mixed-script text aaye to Gemini se saaf karwao (max 2 koshish)."""
+    for _ in range(2):
+        bad = (deva_ratio(g["headline"]) < 0.6 or deva_ratio(g["caption"]) < 0.5
+               or has_mixed(g["headline"]) or has_mixed(g["caption"]))
+        if not bad:
+            break
+        try:
+            fix = gemini(
+                "Neeche ka headline aur caption saaf Hindi (Devanagari) me likho. Meaning, emojis aur lines wahi rakho. "
+                "Naam bhi Devanagari me (jaise सैफ अली खान). OTT, KBC jaise short-form Roman me reh sakte hain. "
+                "Sabse zaruri: ek hi shabd me Hindi aur English akshar mix NAHI hone chahiye "
+                "(galat: बिलियनaire; sahi: बिलियनेयर ya Billionaire). Agar kisi series/film ka naam English hai to use poora Roman me likho.\n\n"
+                f"HEADLINE: {g['headline']}\nCAPTION: {g['caption']}\n\n"
+                'Sirf JSON: {"headline": "...", "highlight": ["headline me 2-4 naam/key shabd, hubahu same"], "caption": "..."}'
+            )
+            g["headline"] = fix.get("headline", g["headline"])
+            g["highlight"] = fix.get("highlight", g.get("highlight", []))
+            g["caption"] = fix.get("caption", g["caption"])
+        except Exception as e:
+            print("hindi fix fail:", e)
+            break
+    return g
 
 def regen_caption(ctx):
     prompt = (
@@ -104,8 +141,8 @@ def reco_json(ctx_titles):
         STYLE + "\n\nAaj ke liye 5 movie/web-series recommend karo jo Netflix, Prime Video, JioHotstar, ZEE5 ya SonyLIV pe dekhi ja sakti hon. "
         "Sirf wo titles do jinke bare me tumhe pakka pata ho. Recent entertainment headlines context ke liye:\n"
         + "\n".join(ctx_titles[:15])
-        + '\n\nSirf JSON: {"items": [{"title": "...", "platform": "...", "line": "ek line kyun dekhein (Hindi, chhoti)"}] (5 items), '
-        '"caption": "Hinglish caption jisme 5 ki list ho", "hashtags": ["#..", ...]}'
+        + '\n\nSirf JSON: {"items": [{"title": "film/series ka naam (Hindi me, jaisa log bolte hain)", "platform": "...", "line": "ek chhoti line kyun dekhein (Devanagari me)"}] (5 items), '
+        '"caption": "Hindi (Devanagari) caption jisme 5 ki list ho", "hashtags": ["#..", ...]}'
     )
     return gemini(prompt)
 
@@ -409,6 +446,8 @@ def mode_draft():
         return
     g = pick_news(cands, recent)
     idx = g.get("index", -1)
+    if 0 <= idx < len(cands):
+        g = ensure_hindi(g)
     if idx < 0 or idx >= len(cands):
         print("kuch kaam ka nahi mila")
         return
