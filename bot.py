@@ -80,7 +80,7 @@ STYLE = (
 )
 
 def pick_news(cands, recent):
-    lst = "\n".join(f"{i}. {c['title']} | {c['summary']}" for i, c in enumerate(cands))
+    lst = "\n".join(f"{i}. {c['title']} | {c['summary'][:300]}" for i, c in enumerate(cands))
     rec = "\n".join(recent[-30:]) or "(koi nahi)"
     prompt = (
         STYLE
@@ -129,9 +129,50 @@ def ensure_hindi(g):
             break
     return g
 
-def regen_caption(ctx):
+def article_text(url, html=None):
+    """Khabar ka poora text (paragraphs) nikalo. Na mile to khali string."""
+    try:
+        if html is None:
+            html = requests.get(url, headers={"User-Agent": UA}, timeout=25).text
+        soup = BeautifulSoup(html, "html.parser")
+        root = soup.find("article") or soup
+        paras = [p.get_text(" ", strip=True) for p in root.find_all("p")]
+        paras = [p for p in paras if len(p) > 50]
+        return "\n".join(paras)[:4500]
+    except Exception as e:
+        print("article fetch fail:", e)
+        return ""
+
+CAPTION_RULES = (
+    "CAPTION ke rules (bahut zaruri):\n"
+    "1. Pehli line: chatpata hook, 1 line.\n"
+    "2. Phir 4-6 chhoti lines me poori kahani: KAUN (naam), KYA hua, KAHAN aur KAB (event, jagah, tareekh), KYUN/kaise (wajah), "
+    "aur zaroori numbers ya bayan.\n"
+    "3. Article ke 3-4 sabse khaas points caption me zaroor aayein, koi bada point chhootna nahi chahiye.\n"
+    "4. Agar do pakshon ke alag daave hain to dono saaf likho aur har daave ke saath likho kiska hai "
+    "(jaise 'manager ka daava hai', 'aarop hai', 'report ke mutabik'). Daave ko pakki baat ki tarah mat likho.\n"
+    "5. Sirf article ke facts likho. Kuch naya mat jodo, andaza mat lagao.\n"
+    "6. Aakhir me ek sawal jisse comments aaye.\n"
+    "Caption lagbhag 700-1100 characters, chhoti chhoti lines, 3-5 emojis."
+)
+
+def write_post(c, text):
+    """Poore article se detail wala headline + caption banao."""
     prompt = (
-        STYLE + f"\n\nKhabar: {ctx['title']} | {ctx['summary']}\nPehle se alag angle ka naya caption likho."
+        STYLE + "\n\n" + CAPTION_RULES
+        + f"\n\nKHABAR TITLE: {c['title']}\nARTICLE TEXT:\n{text}\n\n"
+        + 'Sirf JSON do: {"headline": "POORI Devanagari lipi me hook headline, 12-18 shabd, emoji nahi, naam bhi Devanagari me", '
+        '"highlight": ["headline me 2-4 naam/key shabd, hubahu same"], '
+        '"category": "release|ott|gossip|celeb|outfit|other me se ek", '
+        '"caption": "Hindi (Devanagari) detail caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
+    )
+    return gemini(prompt)
+
+def regen_caption(ctx):
+    body = ctx.get("text") or ctx.get("summary", "")
+    prompt = (
+        STYLE + "\n\n" + CAPTION_RULES
+        + f"\n\nKHABAR TITLE: {ctx['title']}\nARTICLE TEXT:\n{body}\n\nPehle se alag angle/hook ka naya caption likho."
         + '\nSirf JSON: {"caption": "...", "hashtags": ["#..", ...]}'
     )
     return gemini(prompt)
@@ -181,7 +222,7 @@ def candidates(seen):
             out.append({
                 "title": e.get("title", "").strip(),
                 "url": u,
-                "summary": BeautifulSoup(e.get("summary", ""), "html.parser").get_text(" ")[:350],
+                "summary": BeautifulSoup(e.get("summary", ""), "html.parser").get_text(" ")[:1500],
                 "imgs": entry_images(e),
                 "ts": time.mktime(e["published_parsed"]) if e.get("published_parsed") else 0,
             })
@@ -473,12 +514,20 @@ def mode_draft():
         return
     g = pick_news(cands, recent)
     idx = g.get("index", -1)
-    if 0 <= idx < len(cands):
-        g = ensure_hindi(g)
     if idx < 0 or idx >= len(cands):
         print("kuch kaam ka nahi mila")
         return
     c = cands[idx]
+    text = article_text(c["url"])
+    if len(text) < 400:
+        text = c["summary"]  # page nahi khula to RSS ka summary
+    else:
+        try:
+            g.update(write_post(c, text))  # poore article se detail caption
+        except Exception as e:
+            print("write_post fail, pehla caption use hoga:", e)
+    c["text"] = text[:4000]
+    g = ensure_hindi(g)
     seen.append(c["url"])
     save("seen", seen[-2000:])
     imgs = c["imgs"]
