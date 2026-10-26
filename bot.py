@@ -22,6 +22,7 @@ MODELS = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemin
 FB_PAGE = os.environ.get("FB_PAGE_ID", "")
 FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
 GRAPH = os.environ.get("GRAPH_VER", "v23.0")
+IG_ID = os.environ.get("IG_USER_ID", "")  # khali ho to Instagram skip
 FORCE = os.environ.get("FORCE") == "1"  # window ke bahar test karne ke liye
 
 MAX_PENDING = 6        # itne drafts approval ke wait me ho to naya nahi banega
@@ -571,6 +572,35 @@ def post_fb(dr):
         raise RuntimeError(r.text[:300])
     return r.json()
 
+def fb_photo_url(photo_id):
+    """Facebook pe lagi photo ka public link (Instagram ko image_url chahiye)."""
+    r = requests.get(f"https://graph.facebook.com/{GRAPH}/{photo_id}",
+                     params={"fields": "images", "access_token": FB_TOKEN}, timeout=30)
+    if not r.ok:
+        raise RuntimeError("photo url: " + r.text[:200])
+    return r.json()["images"][0]["source"]
+
+def post_ig(image_url, caption):
+    base = f"https://graph.facebook.com/{GRAPH}"
+    r = requests.post(f"{base}/{IG_ID}/media", timeout=120,
+                      data={"image_url": image_url, "caption": caption[:2200], "access_token": FB_TOKEN})
+    if not r.ok:
+        raise RuntimeError("IG media: " + r.text[:300])
+    cid = r.json()["id"]
+    for _ in range(12):  # container taiyaar hone tak wait
+        st = requests.get(f"{base}/{cid}", params={"fields": "status_code", "access_token": FB_TOKEN},
+                          timeout=30).json().get("status_code")
+        if st == "FINISHED":
+            break
+        if st == "ERROR":
+            raise RuntimeError("IG media processing error")
+        time.sleep(5)
+    r = requests.post(f"{base}/{IG_ID}/media_publish", timeout=120,
+                      data={"creation_id": cid, "access_token": FB_TOKEN})
+    if not r.ok:
+        raise RuntimeError("IG publish: " + r.text[:300])
+    return r.json()["id"]
+
 def clear_buttons(mid):
     tg("editMessageReplyMarkup", data={"chat_id": CHAT, "message_id": mid,
                                        "reply_markup": json.dumps({"inline_keyboard": []})})
@@ -634,10 +664,18 @@ def approve_once(wait):
                 say("❌ Reject kar diya")
             elif act == "ok":
                 res = post_fb(dr)
-                pending_del(did)
+                pending_del(did)  # Facebook ho gaya, dobara post na ho isliye draft abhi hata do
                 pending.pop(did)
                 clear_buttons(mid)
-                say(f"✅ Page pe post ho gaya (id: {res.get('post_id') or res.get('id')})")
+                pid = res.get("post_id") or res.get("id")
+                msg = f"✅ Facebook pe post ho gaya\n🔗 https://www.facebook.com/{pid}\n(Group me share karna ho to is link ko kholke Share dabao)"
+                if IG_ID:
+                    try:
+                        iid = post_ig(fb_photo_url(res["id"]), dr["caption"])
+                        msg += f"\n✅ Instagram pe bhi post ho gaya (id: {iid})"
+                    except Exception as e:
+                        msg += f"\n⚠️ Instagram pe nahi hua: {str(e)[:250]}"
+                say(msg)
             elif act == "re":
                 g = regen_caption(dr["ctx"])
                 dr["caption"] = full_caption(g)
