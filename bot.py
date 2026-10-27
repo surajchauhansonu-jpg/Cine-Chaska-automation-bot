@@ -23,6 +23,8 @@ FB_PAGE = os.environ.get("FB_PAGE_ID", "")
 FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
 GRAPH = os.environ.get("GRAPH_VER", "v23.0")
 IG_ID = os.environ.get("IG_USER_ID", "")  # khali ho to Instagram skip
+GROUP = os.environ.get("GROUP_CHAT_ID", "")      # Telegram group ki id (khali ho to group me nahi bhejega)
+GROUP_WHEN = os.environ.get("GROUP_WHEN", "approve")  # "approve" = post hone ke baad, "draft" = draft bante hi
 FORCE = os.environ.get("FORCE") == "1"  # window ke bahar test karne ke liye
 
 MAX_PENDING = 6        # itne drafts approval ke wait me ho to naya nahi banega
@@ -442,6 +444,16 @@ def send_draft(did, jpeg, caption, label):
     })
     return file_id
 
+def send_group(file_id, caption):
+    """Group me poster + caption/hashtags bhejo, bina Approve/Reject buttons ke."""
+    if not GROUP:
+        return
+    try:
+        tg("sendPhoto", data={"chat_id": GROUP, "photo": file_id})
+        tg("sendMessage", data={"chat_id": GROUP, "text": caption[:4000]})
+    except Exception as e:
+        print("group send fail:", e)
+
 def full_caption(g):
     return g["caption"].strip() + "\n\n" + " ".join(g.get("hashtags", []))
 
@@ -504,6 +516,8 @@ def mode_draft():
         did = "r" + hashlib.md5(today.encode()).hexdigest()[:7]
         cap = full_caption(g)
         fid = send_draft(did, jpeg, cap, "🎬 Aaj ke 5 recommendations (titles/platform check kar lena)")
+        if GROUP_WHEN == "draft":
+            send_group(fid, cap)
         pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "reco",
                      "ctx": {"title": "Aaj ke 5 recommendations", "summary": json.dumps(g["items"], ensure_ascii=False)}})
         save("reco", {"date": today})
@@ -553,6 +567,8 @@ def mode_draft():
     did = hashlib.md5(c["url"].encode()).hexdigest()[:8]
     cap = full_caption(g)
     fid = send_draft(did, jpeg, cap, f"📰 {c['title']}\n{c['url']}")
+    if GROUP_WHEN == "draft":
+        send_group(fid, cap)
     pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "news", "ctx": c})
     recent.append(c["title"])
     save("recent", recent[-40:])
@@ -676,6 +692,8 @@ def approve_once(wait):
                     except Exception as e:
                         msg += f"\n⚠️ Instagram pe nahi hua: {str(e)[:250]}"
                 say(msg)
+                if GROUP_WHEN == "approve":
+                    send_group(dr["file_id"], dr["caption"])
             elif act == "re":
                 g = regen_caption(dr["ctx"])
                 dr["caption"] = full_caption(g)
