@@ -57,6 +57,8 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROUP_CHAT_ID: ${{ secrets.GROUP_CHAT_ID }}
+          GROUP_WHEN: "draft"
 
       - name: Save state to GitHub
         run: |
