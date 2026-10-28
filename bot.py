@@ -1,39 +1,835 @@
-name: approve
-on:
-  schedule:
-    - cron: "*/20 0-18 * * *"   # har 20 min, ek run 25 min tak Telegram sunta rehta hai
-  workflow_dispatch:
-concurrency:
-  group: approve
-  cancel-in-progress: false
-permissions:
-  contents: write
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    timeout-minutes: 32
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - run: sudo apt-get update && sudo apt-get install -y libraqm0
-      - name: Hindi font
-        run: |
-          mkdir -p assets
-          [ -f assets/font.ttf ] || curl -fsSL -o assets/font.ttf "https://raw.githubusercontent.com/google/fonts/main/ofl/hind/Hind-Bold.ttf"
-      - run: pip install -r requirements.txt
-      - run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-      - run: mkdir -p data && python bot.py approve
-        env:
-          APPROVE_LOOP: "1500"
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          GROUP_CHAT_ID: ${{ secrets.GROUP_CHAT_ID }}
+"""Cine Chaska bot.
+
+python bot.py draft    -> news chuno, poster + caption banao, Telegram pe approval ke liye bhejo
+python bot.py approve  -> Telegram buttons check karo, Approve hua to Facebook page pe post karo
+"""
+import os, sys, io, re, json, glob, hashlib, time, subprocess, datetime as dt
+import requests, feedparser
+from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageOps
+
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+UA = "Mozilla/5.0 (compatible; CineChaskaBot/1.0)"
+D = "data"
+W, H = 1080, 1350  # 4:5
+
+TG = os.environ.get("TG_TOKEN", "")
+CHAT = os.environ.get("TG_CHAT_ID", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+# pehla model na chale (404/429/503) to agla try hota hai
+MODELS = [m for m in [os.environ.get("GEMINI_MODEL"), "gemini-3.5-flash", "gemini-3.5-flash-lite",
+                      "gemini-3.1-flash-lite", "gemini-3-flash-preview"] if m]
+FB_PAGE = os.environ.get("FB_PAGE_ID", "")
+FB_TOKEN = os.environ.get("FB_PAGE_TOKEN", "")
+GRAPH = os.environ.get("GRAPH_VER", "v23.0")
+IG_ID = os.environ.get("IG_USER_ID", "")  # khali ho to Instagram skip
+GROUP = os.environ.get("GROUP_CHAT_ID", "")      # Telegram group ki id (khali ho to group me nahi bhejega)
+GROUP_WHEN = os.environ.get("GROUP_WHEN", "approve")  # "approve" = post hone ke baad, "draft" = draft bante hi
+FORCE = os.environ.get("FORCE") == "1"  # window ke bahar test karne ke liye
+
+MAX_PENDING = 6        # itne drafts approval ke wait me ho to naya nahi banega
+EXPIRE_HOURS = 4       # itne ghante baad draft purana maana jayega
+RECO_AFTER_HOUR = 20   # roz 8 baje ke baad ek "aaj kya dekhein" post
+
+# Ye feeds test karke dekh lena; jo kaam na kare wo skip ho jata hai
+FEEDS = [
+    "https://www.hindustantimes.com/feeds/rss/entertainment/bollywood/rssfeed.xml",
+    "https://indianexpress.com/section/entertainment/bollywood/feed/",
+    "https://feeds.feedburner.com/ndtvmovies-bollywood",
+    "https://www.koimoi.com/feed/",
+    "https://www.bollywoodhungama.com/rss/news.xml",
+    "https://www.pinkvilla.com/feed",
+]
+
+# ---------------------------------------------------------------- state
+def load(name, default):
+    p = f"{D}/{name}.json"
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+def save(name, val):
+    os.makedirs(D, exist_ok=True)
+    with open(f"{D}/{name}.json", "w", encoding="utf-8") as f:
+        json.dump(val, f, ensure_ascii=False, indent=1)
+
+# ---------------------------------------------------------------- gemini
+def gemini(prompt):
+    last = None
+    for m in MODELS:
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent",
+            headers={"x-goog-api-key": GEMINI_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.8},
+            },
+            timeout=120,
+        )
+        if r.status_code in (404, 429, 503):
+            last = f"{m}: {r.status_code} {r.text[:150]}"
+            print("model skip ->", last)
+            continue
+        r.raise_for_status()
+        print("gemini model:", m)
+        return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    raise RuntimeError("Koi Gemini model nahi chala. Last: " + str(last))
+
+STYLE = (
+    "Tum 'Cine Chaska' naam ke Bollywood news Facebook page ke editor ho. "
+    "Tone: masaledar, chatpati, youth wali, lekin sirf diye gaye facts use karo, koi naya fact ya quote mat banao. "
+    "Poora text (headline aur caption) shuddh Hindi me, Devanagari lipi me, bol-chal wali chatpati bhasha. English ke aam shabd (OTT, KBC, trailer, ad) Roman me chalenge. ZARURI: ek hi shabd me Hindi aur English akshar kabhi mix mat karo. Ya to poora Devanagari (जैसे बिलियनेयर, सीरीज़) ya poora Roman (Billionaire). Series/film ka naam English ho to poora Roman me likho. Caption 4-6 chhoti lines, kuch emojis, aakhir me ek sawal jisse comments aaye."
+)
+
+def pick_news(cands, recent):
+    lst = "\n".join(f"{i}. {c['title']} | {c['summary'][:300]}" for i, c in enumerate(cands))
+    rec = "\n".join(recent[-30:]) or "(koi nahi)"
+    prompt = (
+        STYLE
+        + "\n\nNeeche khabrein hain. Sabse clickable ek chuno (movie release, OTT, gossip, celeb life, outfit)."
+        + " Agar koi khabar 'recent titles' jaisi hi ho to usse mat chuno. Agar sab bekaar hain to index -1 do."
+        + "\n\nKHABREIN:\n" + lst + "\n\nRECENT TITLES:\n" + rec
+        + '\n\nSirf JSON do: {"index": int, "headline": "POORI Devanagari (Hindi) lipi me hook headline, 12-18 shabd, ! ya quote ke saath. Roman/English letters mat use karo (naam bhi Devanagari me, jaise सैफ अली खान, KBC jaise short-form hi Roman me). Emoji bilkul nahi", "highlight": ["headline me jo 2-4 naam/key shabd yellow me chamkane hain, headline se hubahu same"], '
+        '"category": "release|ott|gossip|celeb|outfit|other me se ek", "caption": "Hindi (Devanagari) caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
+    )
+    return gemini(prompt)
+
+def deva_ratio(t):
+    letters = [c for c in t if c.isalpha()]
+    if not letters:
+        return 1.0
+    return sum("\u0900" <= c <= "\u097f" for c in letters) / len(letters)
+
+def has_mixed(t):
+    """Kisi ek shabd me Devanagari aur Roman dono ho (jaise बिलियनaire) to True."""
+    for w in re.split(r"[\s\-–—/]+", t):
+        if re.search("[\u0900-\u097f]", w) and re.search("[A-Za-z]", w):
+            return True
+    return False
+
+def ensure_hindi(g):
+    """Roman ya mixed-script text aaye to Gemini se saaf karwao (max 2 koshish)."""
+    for _ in range(2):
+        bad = (deva_ratio(g["headline"]) < 0.6 or deva_ratio(g["caption"]) < 0.5
+               or has_mixed(g["headline"]) or has_mixed(g["caption"]))
+        if not bad:
+            break
+        try:
+            fix = gemini(
+                "Neeche ka headline aur caption saaf Hindi (Devanagari) me likho. Meaning, emojis aur lines wahi rakho. "
+                "Naam bhi Devanagari me (jaise सैफ अली खान). OTT, KBC jaise short-form Roman me reh sakte hain. "
+                "Sabse zaruri: ek hi shabd me Hindi aur English akshar mix NAHI hone chahiye "
+                "(galat: बिलियनaire; sahi: बिलियनेयर ya Billionaire). Agar kisi series/film ka naam English hai to use poora Roman me likho.\n\n"
+                f"HEADLINE: {g['headline']}\nCAPTION: {g['caption']}\n\n"
+                'Sirf JSON: {"headline": "...", "highlight": ["headline me 2-4 naam/key shabd, hubahu same"], "caption": "..."}'
+            )
+            g["headline"] = fix.get("headline", g["headline"])
+            g["highlight"] = fix.get("highlight", g.get("highlight", []))
+            g["caption"] = fix.get("caption", g["caption"])
+        except Exception as e:
+            print("hindi fix fail:", e)
+            break
+    return g
+
+def article_text(url, html=None):
+    """Khabar ka poora text (paragraphs) nikalo. Na mile to khali string."""
+    try:
+        if html is None:
+            html = requests.get(url, headers={"User-Agent": UA}, timeout=25).text
+        soup = BeautifulSoup(html, "html.parser")
+        root = soup.find("article") or soup
+        paras = [p.get_text(" ", strip=True) for p in root.find_all("p")]
+        paras = [p for p in paras if len(p) > 50]
+        return "\n".join(paras)[:4500]
+    except Exception as e:
+        print("article fetch fail:", e)
+        return ""
+
+CAPTION_RULES = (
+    "CAPTION ke rules (bahut zaruri):\n"
+    "1. Pehli line: chatpata hook, 1 line.\n"
+    "2. Phir 4-6 chhoti lines me poori kahani: KAUN (naam), KYA hua, KAHAN aur KAB (event, jagah, tareekh), KYUN/kaise (wajah), "
+    "aur zaroori numbers ya bayan.\n"
+    "3. Article ke 3-4 sabse khaas points caption me zaroor aayein, koi bada point chhootna nahi chahiye.\n"
+    "4. Agar do pakshon ke alag daave hain to dono saaf likho aur har daave ke saath likho kiska hai "
+    "(jaise 'manager ka daava hai', 'aarop hai', 'report ke mutabik'). Daave ko pakki baat ki tarah mat likho.\n"
+    "5. Sirf article ke facts likho. Kuch naya mat jodo, andaza mat lagao.\n"
+    "6. Aakhir me ek sawal jisse comments aaye.\n"
+    "Caption lagbhag 700-1100 characters, chhoti chhoti lines, 3-5 emojis."
+)
+
+def write_post(c, text):
+    """Poore article se detail wala headline + caption banao."""
+    prompt = (
+        STYLE + "\n\n" + CAPTION_RULES
+        + f"\n\nKHABAR TITLE: {c['title']}\nARTICLE TEXT:\n{text}\n\n"
+        + 'Sirf JSON do: {"headline": "POORI Devanagari lipi me hook headline, 12-18 shabd, emoji nahi, naam bhi Devanagari me", '
+        '"highlight": ["headline me 2-4 naam/key shabd, hubahu same"], '
+        '"category": "release|ott|gossip|celeb|outfit|other me se ek", '
+        '"caption": "Hindi (Devanagari) detail caption", "hashtags": ["#..", "#.."] (6-8 hashtags)}'
+    )
+    return gemini(prompt)
+
+def regen_caption(ctx):
+    body = ctx.get("text") or ctx.get("summary", "")
+    prompt = (
+        STYLE + "\n\n" + CAPTION_RULES
+        + f"\n\nKHABAR TITLE: {ctx['title']}\nARTICLE TEXT:\n{body}\n\nPehle se alag angle/hook ka naya caption likho."
+        + '\nSirf JSON: {"caption": "...", "hashtags": ["#..", ...]}'
+    )
+    return gemini(prompt)
+
+def reco_json(ctx_titles):
+    prompt = (
+        STYLE + "\n\nAaj ke liye 5 movie/web-series recommend karo jo Netflix, Prime Video, JioHotstar, ZEE5 ya SonyLIV pe dekhi ja sakti hon. "
+        "Sirf wo titles do jinke bare me tumhe pakka pata ho. Recent entertainment headlines context ke liye:\n"
+        + "\n".join(ctx_titles[:15])
+        + '\n\nSirf JSON: {"items": [{"title": "film/series ka naam (Hindi me, jaisa log bolte hain)", "platform": "...", "line": "ek chhoti line kyun dekhein (Devanagari me)"}] (5 items), '
+        '"caption": "Hindi (Devanagari) caption jisme 5 ki list ho", "hashtags": ["#..", ...]}'
+    )
+    return gemini(prompt)
+
+# ---------------------------------------------------------------- news
+def entry_images(e):
+    urls = []
+    for k in ("media_content", "media_thumbnail"):
+        for m in e.get(k) or []:
+            u = m.get("url")
+            if u and u not in urls:
+                urls.append(u)
+    for l in e.get("links", []):
+        if l.get("type", "").startswith("image") and l.get("href") not in urls:
+            urls.append(l["href"])
+    return urls
+
+def og_image(url):
+    try:
+        h = requests.get(url, headers={"User-Agent": UA}, timeout=20).text
+        m = BeautifulSoup(h, "html.parser").find("meta", property="og:image")
+        return m["content"] if m and m.get("content") else None
+    except Exception:
+        return None
+
+def candidates(seen):
+    out = []
+    for f in FEEDS:
+        try:
+            d = feedparser.parse(f, agent=UA)
+        except Exception:
+            continue
+        for e in d.entries[:15]:
+            u = e.get("link")
+            if not u or u in seen:
+                continue
+            out.append({
+                "title": e.get("title", "").strip(),
+                "url": u,
+                "summary": BeautifulSoup(e.get("summary", ""), "html.parser").get_text(" ")[:1500],
+                "imgs": entry_images(e),
+                "ts": time.mktime(e["published_parsed"]) if e.get("published_parsed") else 0,
+            })
+    out.sort(key=lambda c: c["ts"], reverse=True)
+    return out[:10]
+
+def download(url):
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
+    r.raise_for_status()
+    return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+# ---------------------------------------------------------------- poster
+FONT = None
+
+def find_font():
+    if os.path.exists("assets/font.ttf"):
+        return "assets/font.ttf"
+    fs = glob.glob("/usr/share/fonts/**/NotoSansDevanagari*.ttf", recursive=True)
+    fs.sort(key=lambda p: ("Bold" not in p, len(p)))
+    if fs:
+        return fs[0]
+    raise SystemExit("Hindi font nahi mila. assets/font.ttf daalo.")
+
+def font(sz):
+    global FONT
+    if FONT is None:
+        FONT = find_font()
+        print("font:", FONT)
+    try:
+        return ImageFont.truetype(FONT, sz, layout_engine=ImageFont.Layout.RAQM)
+    except Exception:
+        return ImageFont.truetype(FONT, sz)
+
+def wrap(d, text, f, maxw):
+    lines, cur = [], ""
+    for w in text.split():
+        t = (cur + " " + w).strip()
+        if d.textlength(t, font=f) <= maxw:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+def cover(img, w, h):
+    r = max(w / img.width, h / img.height)
+    img = img.resize((int(img.width * r) + 1, int(img.height * r) + 1), Image.LANCZOS)
+    x = (img.width - w) // 2
+    y = (img.height - h) // 4  # thoda upar se crop, chehre bachte hain
+    return img.crop((x, y, x + w, y + h))
+
+def find_logo():
+    exts = (".png", ".webp", ".jpg", ".jpeg")
+    found = []
+    for root, _, files in os.walk("assets"):
+        found += [os.path.join(root, f) for f in files if f.lower().endswith(exts)]
+    found += [f for f in os.listdir(".") if f.lower().endswith(exts) and "logo" in f.lower()]
+    found.sort(key=lambda p: ("logo" not in os.path.basename(p).lower(), p))
+    return found[0] if found else None
+
+def add_logo(img):
+    p = find_logo()
+    if not p:
+        print("logo nahi mila, assets/ me logo.png daalo")
+        return
+    lg = Image.open(p).convert("RGBA")
+    lg.thumbnail((190, 190))
+    img.paste(lg, (W - lg.width - 36, 36), lg)
+
+def to_jpeg(img):
+    b = io.BytesIO()
+    img.convert("RGB").save(b, "JPEG", quality=93)
+    return b.getvalue()
+
+GOLD = (255, 196, 0)
+YELLOW = (255, 214, 0)
+CATS = {"release": "नई रिलीज़", "ott": "OTT अपडेट", "gossip": "गॉसिप",
+        "celeb": "सितारों की खबर", "outfit": "फैशन", "other": "ताज़ा खबर"}
+
+def clean(w):
+    return w.strip("।,.!?‘’“”'\"-:;()")
+
+def vgrad(img, y0, y1, a0, a1, rgb):
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    for y in range(y0, y1):
+        t = (y - y0) / max(1, y1 - y0)
+        d.line([(0, y), (img.width, y)], fill=rgb + (int(a0 + (a1 - a0) * t),))
+    return Image.alpha_composite(img, ov)
+
+def same_pic(a, b):
+    sa = a.convert("L").resize((16, 16))
+    sb = b.convert("L").resize((16, 16))
+    diff = sum(abs(x - y) for x, y in zip(sa.getdata(), sb.getdata())) / 256
+    return diff < 18
+
+EMOJI = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200d]")
+
+def no_emoji(t):
+    return re.sub(r"\s+", " ", EMOJI.sub("", t)).strip()
+
+def polish(img):
+    """Photo ko thoda saaf aur chamakdar banao: contrast, rang, sharpness."""
+    img = img.convert("RGB")
+    img = ImageOps.autocontrast(img, cutoff=0.4, preserve_tone=True)
+    img = ImageEnhance.Color(img).enhance(1.10)
+    img = ImageEnhance.Contrast(img).enhance(1.05)
+    return img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=120, threshold=3))
+
+def make_poster(photo, headline, highlight=(), inset=None, category="other"):
+    headline = no_emoji(headline)
+    highlight = [no_emoji(h) for h in highlight]
+
+    # pehle text ka layout nikalo taaki photo ki jagah pata ho
+    probe = ImageDraw.Draw(Image.new("RGB", (W, 10)))
+    for sz in (64, 58, 53, 49, 45, 41):
+        f = font(sz)
+        lines = wrap(probe, headline, f, W - 220)
+        if len(lines) <= 3:
+            break
+    lh = int(sz * 1.5)
+    panel_h = len(lines) * lh + 140
+    p_bot = H - 70
+    p_top = p_bot - panel_h
+
+    if photo is None:
+        # photo nahi hai: gehra gradient background, card beech me
+        p_bot = (H + panel_h) // 2 + 40
+        p_top = p_bot - panel_h
+        img = vgrad(Image.new("RGBA", (W, H), (18, 8, 40, 255)), 0, H, 0, 150, (120, 30, 110))
+        fade = 0
+    elif photo.width / photo.height > 1.05:
+        # chaudi photo: poori dikhao (chehre na katein), peeche blur wala background
+        bg = cover(photo, W, H).filter(ImageFilter.GaussianBlur(32))
+        bg = ImageEnhance.Brightness(bg).enhance(0.55)
+        img = bg.convert("RGBA")
+        fh = int(photo.height * W / photo.width)
+        fg = polish(photo.convert("RGB").resize((W, fh), Image.LANCZOS))
+        fy = max(0, (p_top - 40 - fh) // 2 + 20)
+        img.paste(fg, (0, fy))
+        fade = 120
+    else:
+        img = polish(cover(photo, W, H)).convert("RGBA")
+        fade = 330
+
+    img = vgrad(img, 0, 280, 150, 0, (0, 0, 0))                    # upar logo ke liye halka andhera
+    img = vgrad(img, p_top - fade, p_top, 0, 215, (12, 6, 28))     # photo neeche smoothly dark
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(ov).rounded_rectangle((50, p_top, W - 50, p_bot), radius=36,
+                                         fill=(26, 14, 52, 240), outline=GOLD + (255,), width=3)
+    img = Image.alpha_composite(img, ov).convert("RGB")
+    d = ImageDraw.Draw(img)
+
+    # category pill
+    pf = font(34)
+    label = CATS.get(category, CATS["other"])
+    pw = int(d.textlength(label, font=pf)) + 64
+    px, py = 90, p_top - 30
+    d.rounded_rectangle((px, py, px + pw, py + 60), radius=30, fill=GOLD)
+    d.text((px + pw / 2, py + 30), label, font=pf, fill=(24, 10, 40), anchor="mm")
+
+    # headline (naam yellow me)
+    hl = {clean(w) for h in highlight for w in h.split()}
+    space = d.textlength(" ", font=f)
+    y = p_top + 64
+    for line in lines:
+        words = line.split()
+        lw = sum(d.textlength(w, font=f) for w in words) + space * (len(words) - 1)
+        x = (W - lw) / 2
+        for w in words:
+            d.text((x, y), w, font=f, fill=YELLOW if clean(w) in hl else "white")
+            x += d.textlength(w, font=f) + space
+        y += lh
+
+    d.text((W / 2, p_bot - 38), "C I N E   C H A S K A", font=font(26), fill=GOLD, anchor="mm")
+
+    # gola inset
+    if inset is not None:
+        s_ = 340
+        c = polish(cover(inset, s_, s_))
+        mask = Image.new("L", (s_, s_), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, s_ - 1, s_ - 1), fill=255)
+        x, y0 = 50, p_top - 60 - s_
+        d.ellipse((x - 9, y0 - 9, x + s_ + 9, y0 + s_ + 9), fill=GOLD)
+        img.paste(c, (x, y0), mask)
+
+    add_logo(img)
+    return to_jpeg(img)
+
+def make_reco_poster(items):
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    for yy in range(H):
+        c = int(60 * yy / H)
+        d.line([(0, yy), (W, yy)], fill=(25 + c, 8, 55 + c))
+    d.text((70, 90), "आज क्या देखें?", font=font(96), fill=(255, 196, 0))
+    y = 270
+    for i, it in enumerate(items[:5], 1):
+        d.text((70, y), f"{i}. {it['title']}", font=font(54), fill="white")
+        sub = f"{it['platform']}  •  {it['line']}"
+        sub_lines = wrap(d, sub, font(34), W - 140)
+        d.text((100, y + 72), sub_lines[0], font=font(34), fill=(215, 205, 235))
+        y += 200
+    add_logo(img)
+    return to_jpeg(img)
+
+# ---------------------------------------------------------------- telegram
+def tg(method, **kw):
+    r = requests.post(f"https://api.telegram.org/bot{TG}/{method}", timeout=90, **kw)
+    r.raise_for_status()
+    return r.json()["result"]
+
+def keyboard(did):
+    return json.dumps({"inline_keyboard": [
+        [{"text": "✅ Approve", "callback_data": f"ok:{did}"},
+         {"text": "❌ Reject", "callback_data": f"no:{did}"}],
+        [{"text": "🔁 Caption dobara", "callback_data": f"re:{did}"}],
+    ]})
+
+def send_draft(did, jpeg, caption, label):
+    res = tg("sendPhoto", data={"chat_id": CHAT}, files={"photo": ("p.jpg", jpeg)})
+    file_id = res["photo"][-1]["file_id"]
+    tg("sendMessage", data={
+        "chat_id": CHAT,
+        "text": f"{label}\n\n{caption}"[:4000],
+        "reply_markup": keyboard(did),
+    })
+    return file_id
+
+def send_group(file_id, caption):
+    """Group me poster + caption/hashtags bhejo, bina Approve/Reject buttons ke."""
+    if not GROUP:
+        return
+    try:
+        tg("sendPhoto", data={"chat_id": GROUP, "photo": file_id})
+        tg("sendMessage", data={"chat_id": GROUP, "text": caption[:4000]})
+    except Exception as e:
+        print("group send fail:", e)
+
+def full_caption(g):
+    return g["caption"].strip() + "\n\n" + " ".join(g.get("hashtags", []))
+
+# ---------------------------------------------------------------- modes
+def in_window(now):
+    return 6 <= now.hour < 23 or (now.hour == 23 and now.minute < 20)
+
+# ---- pending drafts: har draft ki apni file (data/pending/<id>.json), taaki draft aur approve aapas me na takraein
+PD = f"{D}/pending"
+
+def pending_load():
+    legacy = load("pending", None)  # purana single-file format ho to usse migrate karo
+    if legacy:
+        for v in legacy.values():
+            pending_put(v)
+        os.remove(f"{D}/pending.json")
+    out = {}
+    if os.path.isdir(PD):
+        for f in os.listdir(PD):
+            if f.endswith(".json"):
+                with open(f"{PD}/{f}", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                out[d["id"]] = d
+    return out
+
+def pending_put(dr):
+    os.makedirs(PD, exist_ok=True)
+    with open(f"{PD}/{dr['id']}.json", "w", encoding="utf-8") as f:
+        json.dump(dr, f, ensure_ascii=False, indent=1)
+
+def pending_del(did):
+    p = f"{PD}/{did}.json"
+    if os.path.exists(p):
+        os.remove(p)
+
+def mode_draft():
+    now = dt.datetime.now(IST)
+    if not FORCE and not in_window(now):
+        print("window ke bahar")
+        return
+    pending = pending_load()
+    for k, v in list(pending.items()):
+        if time.time() - v["created"] >= EXPIRE_HOURS * 3600:
+            pending_del(k)
+            pending.pop(k)
+    if len(pending) >= MAX_PENDING:
+        print("bahut drafts pending hain")
+        return
+
+    seen = load("seen", [])
+    recent = load("recent", [])
+    today = str(now.date())
+    last_reco = load("reco", {}).get("date") or load("state", {}).get("reco")
+
+    # roz ek recommendation post
+    if now.hour >= RECO_AFTER_HOUR and last_reco != today:
+        cands = candidates(set(seen))
+        g = reco_json([c["title"] for c in cands])
+        jpeg = make_reco_poster(g["items"])
+        did = "r" + hashlib.md5(today.encode()).hexdigest()[:7]
+        cap = full_caption(g)
+        fid = send_draft(did, jpeg, cap, "🎬 Aaj ke 5 recommendations (titles/platform check kar lena)")
+        if GROUP_WHEN == "draft":
+            send_group(fid, cap)
+        pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "reco",
+                     "ctx": {"title": "Aaj ke 5 recommendations", "summary": json.dumps(g["items"], ensure_ascii=False)}})
+        save("reco", {"date": today})
+        return
+
+    cands = candidates(set(seen))
+    if not cands:
+        print("nayi khabar nahi")
+        return
+    g = pick_news(cands, recent)
+    idx = g.get("index", -1)
+    if idx < 0 or idx >= len(cands):
+        print("kuch kaam ka nahi mila")
+        return
+    c = cands[idx]
+    text = article_text(c["url"])
+    if len(text) < 400:
+        text = c["summary"]  # page nahi khula to RSS ka summary
+    else:
+        try:
+            g.update(write_post(c, text))  # poore article se detail caption
+        except Exception as e:
+            print("write_post fail, pehla caption use hoga:", e)
+    c["text"] = text[:4000]
+    g = ensure_hindi(g)
+    seen.append(c["url"])
+    save("seen", seen[-2000:])
+    imgs = c["imgs"]
+    img_url = imgs[0] if imgs else og_image(c["url"])
+    if not img_url:
+        print("image nahi mili, skip")
+        return
+    try:
+        photo = download(img_url)
+    except Exception as e:
+        print("image download fail:", e)
+        return
+    inset = None
+    if len(imgs) > 1:  # doosri alag photo mile to gola inset lagega
+        try:
+            second = download(imgs[1])
+            if not same_pic(photo, second):
+                inset = second
+        except Exception:
+            pass
+    jpeg = make_poster(photo, g["headline"], g.get("highlight", []), inset, g.get("category", "other"))
+    did = hashlib.md5(c["url"].encode()).hexdigest()[:8]
+    cap = full_caption(g)
+    fid = send_draft(did, jpeg, cap, f"📰 {c['title']}\n{c['url']}")
+    if GROUP_WHEN == "draft":
+        send_group(fid, cap)
+    pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "news", "ctx": c})
+    recent.append(c["title"])
+    save("recent", recent[-40:])
+
+def post_fb(dr):
+    if not FB_TOKEN or not FB_PAGE:
+        raise RuntimeError("FB_PAGE_ID / FB_PAGE_TOKEN secret workflow tak nahi pahunch raha (approve.yml ke env me dekho)")
+    f = tg("getFile", data={"file_id": dr["file_id"]})
+    img = requests.get(f"https://api.telegram.org/file/bot{TG}/{f['file_path']}", timeout=60).content
+    r = requests.post(
+        f"https://graph.facebook.com/{GRAPH}/{FB_PAGE}/photos",
+        data={"caption": dr["caption"], "access_token": FB_TOKEN},
+        files={"source": ("p.jpg", img)},
+        timeout=120,
+    )
+    if not r.ok:
+        raise RuntimeError(r.text[:300])
+    return r.json()
+
+def fb_photo_url(photo_id):
+    """Facebook pe lagi photo ka public link (Instagram ko image_url chahiye)."""
+    r = requests.get(f"https://graph.facebook.com/{GRAPH}/{photo_id}",
+                     params={"fields": "images", "access_token": FB_TOKEN}, timeout=30)
+    if not r.ok:
+        raise RuntimeError("photo url: " + r.text[:200])
+    return r.json()["images"][0]["source"]
+
+def post_ig(image_url, caption):
+    base = f"https://graph.facebook.com/{GRAPH}"
+    r = requests.post(f"{base}/{IG_ID}/media", timeout=120,
+                      data={"image_url": image_url, "caption": caption[:2200], "access_token": FB_TOKEN})
+    if not r.ok:
+        raise RuntimeError("IG media: " + r.text[:300])
+    cid = r.json()["id"]
+    for _ in range(12):  # container taiyaar hone tak wait
+        st = requests.get(f"{base}/{cid}", params={"fields": "status_code", "access_token": FB_TOKEN},
+                          timeout=30).json().get("status_code")
+        if st == "FINISHED":
+            break
+        if st == "ERROR":
+            raise RuntimeError("IG media processing error")
+        time.sleep(5)
+    r = requests.post(f"{base}/{IG_ID}/media_publish", timeout=120,
+                      data={"creation_id": cid, "access_token": FB_TOKEN})
+    if not r.ok:
+        raise RuntimeError("IG publish: " + r.text[:300])
+    return r.json()["id"]
+
+def clear_buttons(mid):
+    tg("editMessageReplyMarkup", data={"chat_id": CHAT, "message_id": mid,
+                                       "reply_markup": json.dumps({"inline_keyboard": []})})
+
+def say(text):
+    tg("sendMessage", data={"chat_id": CHAT, "text": text[:4000]})
+
+# ---- git helpers (approve loop apni state khud push karta hai)
+def git(*args):
+    return subprocess.run(["git", *args], capture_output=True, text=True)
+
+def git_sync():
+    r = git("pull", "--rebase", "--autostash")
+    if r.returncode:
+        print("git pull problem:", r.stderr[:200])
+
+def git_push():
+    git("add", "data")
+    if git("diff", "--cached", "--quiet").returncode:  # kuch badla hai
+        git("commit", "-m", "approve state")
+        for _ in range(3):
+            git("pull", "--rebase", "--autostash")
+            if git("push").returncode == 0:
+                break
+
+# ---------------------------------------------------------------- tumhari bheji khabar se draft
+URL_RE = re.compile(r"https?://\S+")
+HELP = (
+    "📥 Khabar kaise bhejein:\n"
+    "1) Photo + caption me khabar likhkar ek hi message me bhejo, ya\n"
+    "2) Pehle photo, phir khabar ka text (10 min ke andar), ya\n"
+    "3) Sirf khabar ka link bhejo (photo article se aayegi), ya\n"
+    "4) Sirf text bhejo aur phir /nophoto likho (bina photo ka poster banega).\n"
+    "Photo 'File' ke roop me bhejoge to quality zyada rahegi."
+)
+
+def tg_image(file_id):
+    f = tg("getFile", data={"file_id": file_id})
+    r = requests.get(f"https://api.telegram.org/file/bot{TG}/{f['file_path']}", timeout=60)
+    r.raise_for_status()
+    return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+def build_user_post(text, photo_id):
+    say("⏳ Draft bana raha hoon...")
+    m = URL_RE.search(text)
+    url = m.group(0) if m else ""
+    article = article_text(url) if url else ""
+    body = (text + ("\n\n" + article if article else ""))[:5000]
+    title = URL_RE.sub("", text).strip().split("\n")[0][:120] or "Khabar"
+    c = {"title": title, "url": url}
+    g = ensure_hindi(write_post(c, body))
+    photo = None
+    if photo_id:
+        photo = tg_image(photo_id)
+    elif url:
+        u = og_image(url)
+        if u:
+            try:
+                photo = download(u)
+            except Exception:
+                photo = None
+    jpeg = make_poster(photo, g["headline"], g.get("highlight", []), None, g.get("category", "other"))
+    did = hashlib.md5((text + str(time.time())).encode()).hexdigest()[:8]
+    cap = full_caption(g)
+    fid = send_draft(did, jpeg, cap, "📥 Tumhari bheji khabar se bana draft")
+    pending_put({"id": did, "caption": cap, "file_id": fid, "created": time.time(), "kind": "user",
+                 "ctx": {"title": title, "summary": body[:300], "text": body[:4000]}})
+    if GROUP_WHEN == "draft":
+        send_group(fid, cap)
+
+def handle_user_message(m):
+    if str(m["chat"]["id"]) != str(CHAT):
+        return  # sirf tumhari personal chat se khabar leni hai
+    text = (m.get("text") or m.get("caption") or "").strip()
+    photo_id = None
+    if m.get("photo"):
+        photo_id = m["photo"][-1]["file_id"]
+    elif m.get("document") and str(m["document"].get("mime_type", "")).startswith("image/"):
+        photo_id = m["document"]["file_id"]
+    if text.startswith("/start") or text.startswith("/help"):
+        say(HELP)
+        return
+    inbox = load("inbox", {})
+    if inbox and time.time() - inbox.get("ts", 0) > 600:
+        inbox = {}
+    if text.startswith("/nophoto"):
+        if inbox.get("text"):
+            t, inbox = inbox["text"], {}
+            save("inbox", inbox)
+            build_user_post(t, None)
+        else:
+            say("Pehle khabar ka text bhejo, phir /nophoto likho.")
+        return
+    if text and photo_id:
+        inbox = {}
+        save("inbox", inbox)
+        build_user_post(text, photo_id)
+    elif photo_id:
+        if inbox.get("text"):
+            t, inbox = inbox["text"], {}
+            save("inbox", inbox)
+            build_user_post(t, photo_id)
+        else:
+            save("inbox", {"photo": photo_id, "ts": time.time()})
+            say("📷 Photo mil gayi. Ab khabar ka text bhejo (10 min ke andar).")
+    elif text:
+        if URL_RE.search(text):
+            save("inbox", {})
+            build_user_post(text, None)
+        elif inbox.get("photo"):
+            p, inbox = inbox["photo"], {}
+            save("inbox", inbox)
+            build_user_post(text, p)
+        else:
+            save("inbox", {"text": text, "ts": time.time()})
+            say("📝 Text mil gaya. Ab photo bhejo (10 min ke andar), ya bina photo ke poster ke liye /nophoto likho.")
+
+def approve_once(wait):
+    off = load("offset", {}).get("offset")
+    if off is None:
+        off = load("state", {}).get("offset", 0)
+    ups = tg("getUpdates", data={"offset": off, "timeout": wait,
+                                 "allowed_updates": json.dumps(["callback_query", "message"])})
+    if not ups:
+        return
+    git_sync()  # draft ne jo naye drafts push kiye wo le aao
+    pending = pending_load()
+    print("approve: updates =", len(ups), "| pending =", list(pending))
+    for u in ups:
+        off = u["update_id"] + 1
+        if u.get("message"):
+            try:
+                handle_user_message(u["message"])
+            except Exception as e:
+                say(f"⚠️ Khabar se draft nahi ban paya: {str(e)[:250]}")
+            continue
+        cq = u.get("callback_query")
+        if not cq or str(cq["message"]["chat"]["id"]) != str(CHAT):
+            continue
+        try:
+            tg("answerCallbackQuery", data={"callback_query_id": cq["id"]})
+        except Exception:
+            pass
+        act, _, did = cq["data"].partition(":")
+        mid = cq["message"]["message_id"]
+        dr = pending.get(did)
+        if not dr:
+            try:
+                clear_buttons(mid)
+            except Exception:
+                pass
+            say("⚠️ Ye draft ab pending list me nahi mila (4 ghante se purana ho gaya, ya pehle hi process ho chuka). Naye draft ka wait karo.")
+            continue
+        try:
+            if act == "no":
+                pending_del(did)
+                pending.pop(did)
+                clear_buttons(mid)
+                say("❌ Reject kar diya")
+            elif act == "ok":
+                res = post_fb(dr)
+                pending_del(did)  # Facebook ho gaya, dobara post na ho isliye draft abhi hata do
+                pending.pop(did)
+                clear_buttons(mid)
+                pid = res.get("post_id") or res.get("id")
+                msg = f"✅ Facebook pe post ho gaya\n🔗 https://www.facebook.com/{pid}\n(Group me share karna ho to is link ko kholke Share dabao)"
+                if IG_ID:
+                    try:
+                        iid = post_ig(fb_photo_url(res["id"]), dr["caption"])
+                        msg += f"\n✅ Instagram pe bhi post ho gaya (id: {iid})"
+                    except Exception as e:
+                        msg += f"\n⚠️ Instagram pe nahi hua: {str(e)[:250]}"
+                say(msg)
+                if GROUP_WHEN == "approve":
+                    send_group(dr["file_id"], dr["caption"])
+            elif act == "re":
+                g = regen_caption(dr["ctx"])
+                dr["caption"] = full_caption(g)
+                pending_put(dr)
+                tg("editMessageText", data={"chat_id": CHAT, "message_id": mid,
+                                            "text": f"🔁 Naya caption\n\n{dr['caption']}"[:4000],
+                                            "reply_markup": keyboard(did)})
+        except Exception as e:
+            say(f"⚠️ Error ({act}): {str(e)[:300]}")
+    save("offset", {"offset": off})
+    git_push()
+
+def mode_approve():
+    loop = int(os.environ.get("APPROVE_LOOP", "0"))
+    if not loop:
+        approve_once(0)
+        return
+    print("approve loop:", loop, "sec")
+    end = time.time() + loop
+    while time.time() < end:
+        try:
+            approve_once(25)  # Telegram ka long-poll: click aate hi turant mil jata hai
+        except Exception as e:
+            print("loop error:", e)
+            time.sleep(10)
+
+if __name__ == "__main__":
+    {"draft": mode_draft, "approve": mode_approve}[sys.argv[1]]()
