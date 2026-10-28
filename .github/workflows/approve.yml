@@ -18,6 +18,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - run: sudo apt-get update && sudo apt-get install -y libraqm0
+      - name: Hindi font
+        run: |
+          mkdir -p assets
+          [ -f assets/font.ttf ] || curl -fsSL -o assets/font.ttf "https://raw.githubusercontent.com/google/fonts/main/ofl/hind/Hind-Bold.ttf"
       - run: pip install -r requirements.txt
       - run: |
           git config user.name "bot"
